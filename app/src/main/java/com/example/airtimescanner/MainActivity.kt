@@ -43,6 +43,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
@@ -115,11 +116,11 @@ class MainActivity : ComponentActivity() {
         recognizer.process(image)
             .addOnSuccessListener { result ->
                 val rawText = result.text
-                val detectedPin = extractPin(rawText)
+                val detectedPin = extractRechargeKey(result)
                 runOnUiThread {
                     screenState.value = screenState.value.copy(
                         status = if (detectedPin.isBlank()) {
-                            "No valid airtime PIN found. Try again with better lighting."
+                            "No 17-digit recharge key found. Try a sharper photo of the middle strip."
                         } else {
                             "PIN detected. Review it before dialing."
                         },
@@ -138,25 +139,60 @@ class MainActivity : ComponentActivity() {
             }
     }
 
-    private fun extractPin(text: String): String {
-        val lineCandidates = text
-            .lineSequence()
-            .map { line -> line.filter(Char::isDigit) }
-            .filter { it.length in 10..16 }
-            .toList()
+    private fun extractRechargeKey(result: Text): String {
+        val candidates = mutableListOf<ScoredKey>()
 
-        if (lineCandidates.isNotEmpty()) {
-            return lineCandidates.maxByOrNull { it.length }.orEmpty()
+        result.textBlocks.forEach { block ->
+            block.lines.forEach { line ->
+                val digits = line.text.filter(Char::isDigit)
+                if (digits.length == 17) {
+                    candidates += ScoredKey(digits, scoreLine(line.text))
+                }
+
+                Regex("(?:\\d[\\s-]*){17}").findAll(line.text).forEach { match ->
+                    val normalized = match.value.filter(Char::isDigit)
+                    if (normalized.length == 17) {
+                        candidates += ScoredKey(normalized, scoreLine(line.text) + 20)
+                    }
+                }
+            }
         }
 
-        val compact = text.filter(Char::isDigit)
-        if (compact.length in 10..16) {
-            return compact
+        if (candidates.isNotEmpty()) {
+            return candidates.maxByOrNull { it.score }?.value.orEmpty()
         }
 
-        return Regex("\\d{10,16}").find(text)
-            ?.value
-            .orEmpty()
+        val fallback = Regex("(?:\\d[\\s-]*){17}")
+            .findAll(result.text)
+            .map { it.value.filter(Char::isDigit) }
+            .firstOrNull { it.length == 17 }
+
+        return fallback.orEmpty()
+    }
+
+    private fun scoreLine(text: String): Int {
+        val lower = text.lowercase(Locale.US)
+        var score = 0
+
+        if (Regex("(?:\\d[\\s-]*){17}").containsMatchIn(text)) {
+            score += 50
+        }
+        if (lower.contains("recharge") || lower.contains("key") || lower.contains("airtime")) {
+            score += 35
+        }
+        if (Regex("\\b(?:\\d{4,5}[\\s-]){3}\\d{4,5}\\b").containsMatchIn(text)) {
+            score += 25
+        }
+        if (lower.contains("serial")) {
+            score -= 40
+        }
+        if (lower.contains("batch")) {
+            score -= 40
+        }
+        if (lower.contains("barcode")) {
+            score -= 20
+        }
+        return score
     }
 
     private fun buildDialString(pin: String): String {
@@ -178,6 +214,11 @@ class MainActivity : ComponentActivity() {
         return File.createTempFile("JPEG_${timeStamp}_", ".jpg", storageDir)
     }
 }
+
+private data class ScoredKey(
+    val value: String,
+    val score: Int
+)
 
 data class ScanUiState(
     val status: String,
