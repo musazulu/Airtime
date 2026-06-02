@@ -2,6 +2,8 @@ package com.example.airtimescanner
 
 import android.content.Intent
 import android.net.Uri
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -42,6 +44,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import androidx.exifinterface.media.ExifInterface
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
@@ -110,7 +113,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processImage(uri: Uri) {
-        val image = InputImage.fromFilePath(this, uri)
+        runOnUiThread {
+            screenState.value = screenState.value.copy(status = "Scanning image...")
+        }
+
+        val bitmap = loadProcessedBitmap(uri)
+        if (bitmap == null) {
+            runOnUiThread {
+                screenState.value = screenState.value.copy(
+                    status = "Could not read the image. Try a clearer photo."
+                )
+            }
+            return
+        }
+
+        val image = InputImage.fromBitmap(bitmap, 0)
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
         recognizer.process(image)
@@ -139,6 +156,49 @@ class MainActivity : ComponentActivity() {
             }
     }
 
+    private fun loadProcessedBitmap(uri: Uri): Bitmap? {
+        val rawBitmap = contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input)
+        } ?: return null
+
+        val oriented = applyExifRotation(uri, rawBitmap)
+        return cropMiddleStrip(oriented)
+    }
+
+    private fun applyExifRotation(uri: Uri, bitmap: Bitmap): Bitmap {
+        return try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+                val exif = ExifInterface(fd.fileDescriptor)
+                when (exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_UNDEFINED
+                )) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> rotateBitmap(bitmap, 90f)
+                    ExifInterface.ORIENTATION_ROTATE_180 -> rotateBitmap(bitmap, 180f)
+                    ExifInterface.ORIENTATION_ROTATE_270 -> rotateBitmap(bitmap, 270f)
+                    else -> bitmap
+                }
+            } ?: bitmap
+        } catch (_: Exception) {
+            bitmap
+        }
+    }
+
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        val matrix = android.graphics.Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    private fun cropMiddleStrip(bitmap: Bitmap): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val cropWidth = (width * 0.92f).toInt().coerceAtMost(width)
+        val cropHeight = (height * 0.42f).toInt().coerceAtMost(height)
+        val left = ((width - cropWidth) / 2).coerceAtLeast(0)
+        val top = ((height - cropHeight) / 2).coerceAtLeast(0)
+        return Bitmap.createBitmap(bitmap, left, top, cropWidth, cropHeight)
+    }
+
     private fun extractRechargeKey(result: Text): String {
         val candidates = mutableListOf<ScoredKey>()
 
@@ -162,8 +222,7 @@ class MainActivity : ComponentActivity() {
             return candidates.maxByOrNull { it.score }?.value.orEmpty()
         }
 
-        val fallback = Regex("(?:\\d[\\s-]*){17}")
-            .findAll(result.text)
+        val fallback = Regex("(?:\\d[\\s-]*){17}").findAll(result.text)
             .map { it.value.filter(Char::isDigit) }
             .firstOrNull { it.length == 17 }
 
