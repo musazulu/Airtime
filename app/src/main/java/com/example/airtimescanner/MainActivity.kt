@@ -96,11 +96,6 @@ data class AppUiState(
     val history: List<RechargeRecord> = emptyList()
 )
 
-private data class ScoredKey(
-    val value: String,
-    val score: Int
-)
-
 private data class ScanAttempt(
     val rawText: String,
     val detectedKeys: List<String>,
@@ -418,24 +413,108 @@ private data class ScoredKey(
     val score: Int
 )
 
-data class ScanUiState(
-    val status: String,
-    val rawText: String,
-    val detectedKeys: List<String>,
-    val activeKeyIndex: Int
+data class RechargeRecord(
+    val key: String,
+    val scannedAt: Long,
+    val redeemedAt: Long? = null
 ) {
-    val activeKey: String
-        get() = detectedKeys.getOrNull(activeKeyIndex).orEmpty()
+    val expiresAt: Long
+        get() = scannedAt + 30L * 24L * 60L * 60L * 1000L
 
-    val hasMoreKeys: Boolean
-        get() = activeKeyIndex < detectedKeys.lastIndex
-
-    val isComplete: Boolean
-        get() = detectedKeys.isNotEmpty() && activeKeyIndex >= detectedKeys.size
-
-    val dialString: String
-        get() = if (activeKey.isBlank()) "" else "*121*$activeKey#"
+    fun isExpired(now: Long = System.currentTimeMillis()): Boolean {
+        return now >= expiresAt
+    }
 }
+
+class RechargeStore(private val context: android.content.Context) {
+    private val prefs = context.getSharedPreferences("recharge_store", android.content.Context.MODE_PRIVATE)
+
+    fun loadRecords(): List<RechargeRecord> {
+        val raw = prefs.getString("records", "[]").orEmpty()
+        val now = System.currentTimeMillis()
+        val records = parseRecords(raw)
+            .filterNot { it.isExpired(now) }
+            .sortedByDescending { it.scannedAt }
+
+        if (records.size != parseRecords(raw).size) {
+            saveRecords(records)
+        }
+
+        return records
+    }
+
+    fun upsertDetectedKeys(keys: List<String>) {
+        if (keys.isEmpty()) return
+
+        val now = System.currentTimeMillis()
+        val existing = loadRecords().associateBy { it.key }.toMutableMap()
+
+        keys.forEach { key ->
+            if (!existing.containsKey(key)) {
+                existing[key] = RechargeRecord(key = key, scannedAt = now, redeemedAt = null)
+            }
+        }
+
+        saveRecords(existing.values.sortedByDescending { it.scannedAt })
+    }
+
+    fun markRedeemed(key: String) {
+        if (key.isBlank()) return
+
+        val now = System.currentTimeMillis()
+        val updated = loadRecords().map { record ->
+            if (record.key == key && record.redeemedAt == null) {
+                record.copy(redeemedAt = now)
+            } else {
+                record
+            }
+        }
+        saveRecords(updated)
+    }
+
+    private fun saveRecords(records: List<RechargeRecord>) {
+        val array = org.json.JSONArray()
+        records.filterNot { it.isExpired() }.forEach { record ->
+            array.put(
+                org.json.JSONObject().apply {
+                    put("key", record.key)
+                    put("scannedAt", record.scannedAt)
+                    if (record.redeemedAt != null) {
+                        put("redeemedAt", record.redeemedAt)
+                    } else {
+                        put("redeemedAt", org.json.JSONObject.NULL)
+                    }
+                }
+            )
+        }
+        prefs.edit().putString("records", array.toString()).apply()
+    }
+
+    private fun parseRecords(raw: String): List<RechargeRecord> {
+        if (raw.isBlank()) return emptyList()
+
+        val array = org.json.JSONArray(raw)
+        val results = mutableListOf<RechargeRecord>()
+
+        for (i in 0 until array.length()) {
+            val obj = array.optJSONObject(i) ?: continue
+            val key = obj.optString("key").trim()
+            if (key.isBlank()) continue
+
+            val scannedAt = obj.optLong("scannedAt", System.currentTimeMillis())
+            val redeemedAt = if (obj.isNull("redeemedAt")) null else obj.optLong("redeemedAt")
+            results += RechargeRecord(key = key, scannedAt = scannedAt, redeemedAt = redeemedAt)
+        }
+
+        return results.distinctBy { it.key }
+    }
+}
+
+data class AppUiState(
+    val screen: AppScreen = AppScreen.Scanner,
+    val scan: ScanUiState = ScanUiState(),
+    val history: List<RechargeRecord> = emptyList()
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
