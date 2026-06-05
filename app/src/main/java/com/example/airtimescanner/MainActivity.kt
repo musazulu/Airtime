@@ -454,7 +454,9 @@ private fun ScannerScreen(
     )
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Airtime Scanner") }) }
+        topBar = {
+            TopAppBar(title = { Text("Airtime Scanner") })
+        }
     ) { padding ->
         Column(
             modifier = Modifier
@@ -618,7 +620,9 @@ private fun HistoryScreen(
     )
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Recharge History") }) }
+        topBar = {
+            TopAppBar(title = { Text("Recharge History") })
+        }
     ) { padding ->
         Column(
             modifier = Modifier
