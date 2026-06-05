@@ -1,9 +1,14 @@
 package com.example.airtimescanner
 
 import android.content.Intent
-import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -17,18 +22,23 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -45,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
+import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
@@ -53,23 +64,62 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.thread
+
+enum class AppScreen {
+    Scanner,
+    History
+}
+
+data class ScanUiState(
+    val status: String = "Take a photo of the scratch card, then scan the recharge keys.",
+    val rawText: String = "",
+    val detectedKeys: List<String> = emptyList(),
+    val activeKeyIndex: Int = 0
+) {
+    val activeKey: String
+        get() = detectedKeys.getOrNull(activeKeyIndex).orEmpty()
+
+    val hasMoreKeys: Boolean
+        get() = activeKeyIndex < detectedKeys.lastIndex
+
+    val isComplete: Boolean
+        get() = detectedKeys.isNotEmpty() && activeKeyIndex >= detectedKeys.size
+
+    val dialString: String
+        get() = if (activeKey.isBlank()) "" else "*121*$activeKey#"
+}
+
+data class AppUiState(
+    val screen: AppScreen = AppScreen.Scanner,
+    val scan: ScanUiState = ScanUiState(),
+    val history: List<RechargeRecord> = emptyList()
+)
+
+private data class ScoredKey(
+    val value: String,
+    val score: Int
+)
+
+private data class ScanAttempt(
+    val rawText: String,
+    val detectedKeys: List<String>,
+    val score: Int,
+    val errorMessage: String = ""
+)
 
 class MainActivity : ComponentActivity() {
+    private lateinit var store: RechargeStore
     private var pendingImageUri: Uri? = null
-    private val screenState = mutableStateOf(
-        ScanUiState(
-            status = "Take a photo of the scratch card, then confirm the detected PIN.",
-            rawText = "",
-            detectedPin = "",
-            dialString = ""
-        )
-    )
+    private val appState = mutableStateOf(AppUiState())
 
     private val takePictureLauncher =
         registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
             val uri = pendingImageUri
             if (success && uri != null) {
                 processImage(uri)
+            } else {
+                updateStatus("Camera capture was cancelled.")
             }
         }
 
@@ -77,28 +127,65 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
             if (uri != null) {
                 processImage(uri)
+            } else {
+                updateStatus("No image selected.")
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        store = RechargeStore(this)
+        refreshHistory()
 
         setContent {
             AirtimeScannerTheme {
-                ScannerScreen(
-                    uiState = screenState.value,
-                    onCapture = { launchCamera() },
-                    onPickImage = { pickImageLauncher.launch("image/*") },
-                    onPinChanged = { updatedPin ->
-                        screenState.value = screenState.value.copy(
-                            detectedPin = updatedPin,
-                            dialString = buildDialString(updatedPin)
-                        )
-                    },
-                    onDial = { dialAirtime(screenState.value.detectedPin) }
-                )
+                when (appState.value.screen) {
+                    AppScreen.Scanner -> ScannerScreen(
+                        uiState = appState.value.scan,
+                        historyCount = appState.value.history.size,
+                        onCapture = { launchCamera() },
+                        onPickImage = { pickImageLauncher.launch("image/*") },
+                        onOpenHistory = { openHistory() },
+                        onPinChanged = { updatedPin ->
+                            appState.value = appState.value.copy(
+                                scan = appState.value.scan.copy(
+                                    detectedKeys = if (updatedPin.isBlank()) emptyList() else listOf(updatedPin),
+                                    activeKeyIndex = 0
+                                )
+                            )
+                        },
+                        onDial = { dialAirtime(appState.value.scan.activeKey) },
+                        onMarkUsedAndNext = { markUsedAndNext() }
+                    )
+
+                    AppScreen.History -> HistoryScreen(
+                        records = appState.value.history,
+                        onBack = { openScanner() },
+                        onRefresh = { refreshHistory() }
+                    )
+                }
             }
         }
+    }
+
+    private fun openScanner() {
+        refreshHistory()
+        appState.value = appState.value.copy(screen = AppScreen.Scanner)
+    }
+
+    private fun openHistory() {
+        refreshHistory()
+        appState.value = appState.value.copy(screen = AppScreen.History)
+    }
+
+    private fun refreshHistory() {
+        appState.value = appState.value.copy(history = store.loadRecords())
+    }
+
+    private fun updateStatus(message: String) {
+        appState.value = appState.value.copy(
+            scan = appState.value.scan.copy(status = message)
+        )
     }
 
     private fun launchCamera() {
@@ -113,56 +200,105 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processImage(uri: Uri) {
-        runOnUiThread {
-            screenState.value = screenState.value.copy(status = "Scanning image...")
-        }
+        updateStatus("Scanning image...")
 
-        val bitmap = loadProcessedBitmap(uri)
-        if (bitmap == null) {
+        thread(name = "airtime-ocr") {
+            val bitmaps = loadProcessedBitmaps(uri)
+            if (bitmaps.isEmpty()) {
+                runOnUiThread { updateStatus("Could not read the image. Try a clearer photo.") }
+                return@thread
+            }
+
+            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            val attempts = mutableListOf<ScanAttempt>()
+
+            bitmaps.forEachIndexed { index, bitmap ->
+                runOnUiThread { updateStatus("Scanning crop ${index + 1}/${bitmaps.size}...") }
+
+                try {
+                    val text = Tasks.await(recognizer.process(InputImage.fromBitmap(bitmap, 0)))
+                    val keys = extractRechargeKeys(text)
+                    attempts += ScanAttempt(
+                        rawText = text.text,
+                        detectedKeys = keys,
+                        score = scoreResult(text, keys)
+                    )
+                } catch (error: Exception) {
+                    attempts += ScanAttempt(
+                        rawText = "",
+                        detectedKeys = emptyList(),
+                        score = Int.MIN_VALUE,
+                        errorMessage = error.localizedMessage ?: "unknown error"
+                    )
+                }
+            }
+
+            val allKeys = attempts.flatMap { it.detectedKeys }.distinct()
+            val bestAttempt = attempts.maxByOrNull { it.score }
+
+            if (allKeys.isNotEmpty()) {
+                store.upsertDetectedKeys(allKeys)
+            }
+
             runOnUiThread {
-                screenState.value = screenState.value.copy(
-                    status = "Could not read the image. Try a clearer photo."
+                appState.value = appState.value.copy(
+                    history = store.loadRecords(),
+                    scan = ScanUiState(
+                        status = when {
+                            allKeys.isNotEmpty() -> "Found ${allKeys.size} recharge key(s). Use the first one, then mark it used and move to the next."
+                            bestAttempt?.errorMessage?.isNotBlank() == true -> "OCR failed: ${bestAttempt.errorMessage}"
+                            else -> "No 17-digit recharge key found. Try a sharper photo of the middle strip."
+                        },
+                        rawText = bestAttempt?.rawText.orEmpty(),
+                        detectedKeys = allKeys,
+                        activeKeyIndex = 0
+                    )
                 )
             }
-            return
         }
-
-        val image = InputImage.fromBitmap(bitmap, 0)
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-
-        recognizer.process(image)
-            .addOnSuccessListener { result ->
-                val rawText = result.text
-                val detectedPin = extractRechargeKey(result)
-                runOnUiThread {
-                    screenState.value = screenState.value.copy(
-                        status = if (detectedPin.isBlank()) {
-                            "No 17-digit recharge key found. Try a sharper photo of the middle strip."
-                        } else {
-                            "PIN detected. Review it before dialing."
-                        },
-                        rawText = rawText,
-                        detectedPin = detectedPin,
-                        dialString = buildDialString(detectedPin)
-                    )
-                }
-            }
-            .addOnFailureListener { error ->
-                runOnUiThread {
-                    screenState.value = screenState.value.copy(
-                        status = "OCR failed: ${error.localizedMessage ?: "unknown error"}"
-                    )
-                }
-            }
     }
 
-    private fun loadProcessedBitmap(uri: Uri): Bitmap? {
+    private fun markUsedAndNext() {
+        val currentKey = appState.value.scan.activeKey
+        if (currentKey.isBlank()) return
+
+        store.markRedeemed(currentKey)
+        refreshHistory()
+
+        val scan = appState.value.scan
+        val nextIndex = scan.activeKeyIndex + 1
+        val nextScan = if (nextIndex < scan.detectedKeys.size) {
+            scan.copy(
+                activeKeyIndex = nextIndex,
+                status = "Marked used. Ready for the next recharge key."
+            )
+        } else {
+            scan.copy(
+                activeKeyIndex = scan.detectedKeys.size,
+                status = "All recharge keys on this card have been processed."
+            )
+        }
+
+        appState.value = appState.value.copy(scan = nextScan)
+    }
+
+    private fun loadProcessedBitmaps(uri: Uri): List<Bitmap> {
         val rawBitmap = contentResolver.openInputStream(uri)?.use { input ->
             BitmapFactory.decodeStream(input)
-        } ?: return null
+        } ?: return emptyList()
 
         val oriented = applyExifRotation(uri, rawBitmap)
-        return cropMiddleStrip(oriented)
+
+        val candidates = listOf(
+            oriented,
+            cropStrip(oriented, 0.20f, 0.46f),
+            cropStrip(oriented, 0.28f, 0.38f),
+            cropStrip(oriented, 0.34f, 0.30f)
+        )
+
+        return candidates
+            .map { enhanceBitmap(it) }
+            .distinctBy { it.width to it.height }
     }
 
     private fun applyExifRotation(uri: Uri, bitmap: Bitmap): Bitmap {
@@ -185,72 +321,75 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
-        val matrix = android.graphics.Matrix().apply { postRotate(degrees) }
+        val matrix = Matrix().apply { postRotate(degrees) }
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
-    private fun cropMiddleStrip(bitmap: Bitmap): Bitmap {
+    private fun cropStrip(bitmap: Bitmap, topRatio: Float, heightRatio: Float): Bitmap {
         val width = bitmap.width
         val height = bitmap.height
         val cropWidth = (width * 0.92f).toInt().coerceAtMost(width)
-        val cropHeight = (height * 0.42f).toInt().coerceAtMost(height)
+        val cropHeight = (height * heightRatio).toInt().coerceAtMost(height)
         val left = ((width - cropWidth) / 2).coerceAtLeast(0)
-        val top = ((height - cropHeight) / 2).coerceAtLeast(0)
+        val top = (height * topRatio).toInt().coerceIn(0, (height - cropHeight).coerceAtLeast(0))
         return Bitmap.createBitmap(bitmap, left, top, cropWidth, cropHeight)
     }
 
-    private fun extractRechargeKey(result: Text): String {
-        val candidates = mutableListOf<ScoredKey>()
+    private fun enhanceBitmap(bitmap: Bitmap): Bitmap {
+        val targetWidth = 1600
+        val scale = targetWidth.toFloat() / bitmap.width.toFloat()
+        val scaledHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(bitmap, targetWidth, scaledHeight, true)
 
-        result.textBlocks.forEach { block ->
+        val output = Bitmap.createBitmap(scaled.width, scaled.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val matrix = ColorMatrix().apply { setSaturation(0f) }
+        paint.colorFilter = ColorMatrixColorFilter(matrix)
+        canvas.drawBitmap(scaled, 0f, 0f, paint)
+        return output
+    }
+
+    private fun extractRechargeKeys(text: Text): List<String> {
+        val results = mutableListOf<String>()
+        text.textBlocks.forEach { block ->
             block.lines.forEach { line ->
-                val digits = line.text.filter(Char::isDigit)
-                if (digits.length == 17) {
-                    candidates += ScoredKey(digits, scoreLine(line.text))
-                }
-
-                Regex("(?:\\d[\\s-]*){17}").findAll(line.text).forEach { match ->
-                    val normalized = match.value.filter(Char::isDigit)
-                    if (normalized.length == 17) {
-                        candidates += ScoredKey(normalized, scoreLine(line.text) + 20)
-                    }
-                }
+                results += extractKeysFromLine(line.text)
             }
         }
 
-        if (candidates.isNotEmpty()) {
-            return candidates.maxByOrNull { it.score }?.value.orEmpty()
+        if (results.isEmpty()) {
+            results += extractKeysFromLine(text.text)
         }
 
-        val fallback = Regex("(?:\\d[\\s-]*){17}").findAll(result.text)
-            .map { it.value.filter(Char::isDigit) }
-            .firstOrNull { it.length == 17 }
+        return results.distinct()
+    }
 
-        return fallback.orEmpty()
+    private fun extractKeysFromLine(text: String): List<String> {
+        return Regex("(?:\\d[\\s-]*){17}")
+            .findAll(text)
+            .map { it.value.filter(Char::isDigit) }
+            .filter { it.length == 17 }
+            .toList()
+    }
+
+    private fun scoreResult(text: Text, keys: List<String>): Int {
+        var score = keys.size * 100
+        score += scoreLine(text.text)
+        score += text.textBlocks.size * 2
+        return score
     }
 
     private fun scoreLine(text: String): Int {
         val lower = text.lowercase(Locale.US)
         var score = 0
 
-        if (Regex("(?:\\d[\\s-]*){17}").containsMatchIn(text)) {
-            score += 50
-        }
-        if (lower.contains("recharge") || lower.contains("key") || lower.contains("airtime")) {
-            score += 35
-        }
-        if (Regex("\\b(?:\\d{4,5}[\\s-]){3}\\d{4,5}\\b").containsMatchIn(text)) {
-            score += 25
-        }
-        if (lower.contains("serial")) {
-            score -= 40
-        }
-        if (lower.contains("batch")) {
-            score -= 40
-        }
-        if (lower.contains("barcode")) {
-            score -= 20
-        }
+        if (Regex("(?:\\d[\\s-]*){17}").containsMatchIn(text)) score += 50
+        if (lower.contains("recharge") || lower.contains("key") || lower.contains("airtime")) score += 35
+        if (Regex("\\b(?:\\d{4,5}[\\s-]){3}\\d{4,5}\\b").containsMatchIn(text)) score += 25
+        if (lower.contains("serial")) score -= 40
+        if (lower.contains("batch")) score -= 40
+        if (lower.contains("barcode")) score -= 20
         return score
     }
 
@@ -282,27 +421,40 @@ private data class ScoredKey(
 data class ScanUiState(
     val status: String,
     val rawText: String,
-    val detectedPin: String,
+    val detectedKeys: List<String>,
+    val activeKeyIndex: Int
+) {
+    val activeKey: String
+        get() = detectedKeys.getOrNull(activeKeyIndex).orEmpty()
+
+    val hasMoreKeys: Boolean
+        get() = activeKeyIndex < detectedKeys.lastIndex
+
+    val isComplete: Boolean
+        get() = detectedKeys.isNotEmpty() && activeKeyIndex >= detectedKeys.size
+
     val dialString: String
-)
+        get() = if (activeKey.isBlank()) "" else "*121*$activeKey#"
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ScannerScreen(
     uiState: ScanUiState,
+    historyCount: Int,
     onCapture: () -> Unit,
     onPickImage: () -> Unit,
+    onOpenHistory: () -> Unit,
     onPinChanged: (String) -> Unit,
-    onDial: () -> Unit
+    onDial: () -> Unit,
+    onMarkUsedAndNext: () -> Unit
 ) {
     val gradient = Brush.verticalGradient(
         colors = listOf(Color(0xFF0E1B16), Color(0xFF143428), Color(0xFF1F5A45))
     )
 
     Scaffold(
-        topBar = {
-            TopAppBar(title = { Text("Airtime Scanner") })
-        }
+        topBar = { TopAppBar(title = { Text("Airtime Scanner") }) }
     ) { padding ->
         Column(
             modifier = Modifier
@@ -321,7 +473,7 @@ private fun ScannerScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "Scan a scratch card, detect the PIN, then open the dialer.",
+                        text = "Scan every recharge key on the card, then dial them one by one.",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold
                     )
@@ -341,19 +493,15 @@ private fun ScannerScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Search, contentDescription = null, tint = Color.White)
                         Spacer(modifier = Modifier.size(8.dp))
-                        Text(
-                            text = "Detected PIN",
-                            color = Color.White,
-                            style = MaterialTheme.typography.titleMedium
-                        )
+                        Text("Current Key", color = Color.White, style = MaterialTheme.typography.titleMedium)
                     }
 
                     OutlinedTextField(
-                        value = uiState.detectedPin,
+                        value = uiState.activeKey,
                         onValueChange = onPinChanged,
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Airtime PIN") },
-                        placeholder = { Text("Enter or edit the detected PIN") }
+                        label = { Text("Recharge key") },
+                        placeholder = { Text("The current 17-digit key") }
                     )
 
                     Text(
@@ -361,14 +509,27 @@ private fun ScannerScreen(
                         color = Color(0xFFD5E8D4)
                     )
 
-                    Button(
-                        onClick = onDial,
-                        enabled = uiState.detectedPin.isNotBlank(),
-                        modifier = Modifier.fillMaxWidth()
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Icon(Icons.Default.Call, contentDescription = null)
-                        Spacer(modifier = Modifier.size(8.dp))
-                        Text("Open Dialer")
+                        Button(
+                            onClick = onDial,
+                            enabled = uiState.activeKey.isNotBlank(),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Call, contentDescription = null)
+                            Spacer(modifier = Modifier.size(8.dp))
+                            Text("Open Dialer")
+                        }
+
+                        OutlinedButton(
+                            onClick = onMarkUsedAndNext,
+                            enabled = uiState.activeKey.isNotBlank(),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Used & Next")
+                        }
                     }
                 }
             }
@@ -382,12 +543,8 @@ private fun ScannerScreen(
                     modifier = Modifier.padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text(
-                        text = "Capture",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Text("Take a clear photo. Keep the scratch digits centered and well lit.")
+                    Text("Capture", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("Take a clear photo. Keep all scratch strips visible and upright.")
                     Button(onClick = onCapture, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.CameraAlt, contentDescription = null)
                         Spacer(modifier = Modifier.size(8.dp))
@@ -397,6 +554,35 @@ private fun ScannerScreen(
                         Icon(Icons.Default.Search, contentDescription = null)
                         Spacer(modifier = Modifier.size(8.dp))
                         Text("Pick Photo from Gallery")
+                    }
+                    OutlinedButton(onClick = onOpenHistory, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.History, contentDescription = null)
+                        Spacer(modifier = Modifier.size(8.dp))
+                        Text("Stored Numbers ($historyCount)")
+                    }
+                }
+            }
+
+            if (uiState.detectedKeys.isNotEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F7F5))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text("Detected Keys", fontWeight = FontWeight.SemiBold)
+                        Text("${uiState.detectedKeys.size} recharge key(s) found on this image.")
+                        uiState.detectedKeys.forEachIndexed { index, key ->
+                            FilterChip(
+                                selected = index == uiState.activeKeyIndex,
+                                onClick = { },
+                                label = { Text("${index + 1}. $key") }
+                            )
+                            Spacer(modifier = Modifier.size(4.dp))
+                        }
                     }
                 }
             }
@@ -420,7 +606,94 @@ private fun ScannerScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HistoryScreen(
+    records: List<RechargeRecord>,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    val gradient = Brush.verticalGradient(
+        colors = listOf(Color(0xFF0B1410), Color(0xFF10261D), Color(0xFF184734))
+    )
+
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("Recharge History") }) }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(gradient)
+                .padding(padding)
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.elevatedCardColors(containerColor = Color(0xFFF4F6F4))
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Stored recharge keys are kept for 30 days.",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text("This view shows the scanned numbers, when they were saved, and whether they were marked used.")
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(onClick = onBack) { Text("Back") }
+                OutlinedButton(onClick = onRefresh) { Text("Refresh") }
+            }
+
+            if (records.isEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F7F5))
+                ) {
+                    Column(modifier = Modifier.padding(18.dp)) {
+                        Text("No stored numbers yet.")
+                    }
+                }
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(records) { record ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(24.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F7F5))
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(18.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(record.key, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                Text("Saved: ${record.scannedAt.toDisplayDate()}")
+                                Text("Status: ${if (record.redeemedAt == null) "Pending" else "Used"}")
+                                Text("Expires: ${record.expiresAt.toDisplayDate()}")
+                                if (record.redeemedAt != null) {
+                                    Text("Used: ${record.redeemedAt.toDisplayDate()}")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun AirtimeScannerTheme(content: @Composable () -> Unit) {
     MaterialTheme(content = content)
+}
+
+private fun Long.toDisplayDate(): String {
+    val format = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+    return format.format(Date(this))
 }
