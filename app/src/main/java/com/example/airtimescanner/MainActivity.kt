@@ -66,6 +66,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.concurrent.thread
 
+// rebuild marker to force a real tree update
 enum class AppScreen {
     Scanner,
     History
