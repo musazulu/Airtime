@@ -243,7 +243,7 @@ class MainActivity : ComponentActivity() {
                         status = when {
                             allKeys.isNotEmpty() -> "Found ${allKeys.size} recharge key(s). Use the first one, then mark it used and move to the next."
                             bestAttempt?.errorMessage?.isNotBlank() == true -> "OCR failed: ${bestAttempt.errorMessage}"
-                            else -> "No 17-digit recharge key found. Try a sharper photo of the middle strip."
+                            else -> "No 17-digit recharge key found. Try a sharper photo of the scratch strip."
                         },
                         rawText = bestAttempt?.rawText.orEmpty(),
                         detectedKeys = allKeys,
@@ -362,11 +362,30 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun extractKeysFromLine(text: String): List<String> {
-        return Regex("(?:\\d[\\s-]*){17}")
-            .findAll(text)
-            .map { it.value.filter(Char::isDigit) }
-            .filter { it.length == 17 }
-            .toList()
+        val results = mutableListOf<String>()
+
+        // Primary pattern: strict Econet format XXXXX XXXX XXXX XXXX (5+4+4+4 = 17 digits)
+        // Also handles OCR noise like dashes instead of spaces, or slight group size variation
+        val strictPattern = Regex("""\d{4,6}[\s\-]+\d{3,5}[\s\-]+\d{3,5}[\s\-]+\d{3,5}""")
+        strictPattern.findAll(text).forEach { match ->
+            val digits = match.value.filter(Char::isDigit)
+            if (digits.length == 17) {
+                results += digits
+            }
+        }
+
+        // Fallback: 17 digits with any whitespace/dashes between them
+        if (results.isEmpty()) {
+            val fallback = Regex("""(?:\d[\s\-]*){17}""")
+            fallback.findAll(text).forEach { match ->
+                val digits = match.value.filter(Char::isDigit)
+                if (digits.length == 17) {
+                    results += digits
+                }
+            }
+        }
+
+        return results.distinct()
     }
 
     private fun scoreResult(text: Text, keys: List<String>): Int {
@@ -380,9 +399,12 @@ class MainActivity : ComponentActivity() {
         val lower = text.lowercase(Locale.US)
         var score = 0
 
-        if (Regex("(?:\\d[\\s-]*){17}").containsMatchIn(text)) score += 50
+        // Reward strict 17-digit grouped key pattern (XXXXX XXXX XXXX XXXX)
+        if (Regex("""\d{4,6}[\s\-]+\d{3,5}[\s\-]+\d{3,5}[\s\-]+\d{3,5}""").containsMatchIn(text)) score += 60
+        if (Regex("""(?:\d[\s\-]*){17}""").containsMatchIn(text)) score += 40
         if (lower.contains("recharge") || lower.contains("key") || lower.contains("airtime")) score += 35
-        if (Regex("\\b(?:\\d{4,5}[\\s-]){3}\\d{4,5}\\b").containsMatchIn(text)) score += 25
+        if (lower.contains("econet") || lower.contains("telecel")) score += 20
+        // Penalise lines that are clearly serial/batch/barcode metadata
         if (lower.contains("serial")) score -= 40
         if (lower.contains("batch")) score -= 40
         if (lower.contains("barcode")) score -= 20
@@ -480,7 +502,7 @@ private fun ScannerScreen(
                         onValueChange = onPinChanged,
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("Recharge key") },
-                        placeholder = { Text("The current 17-digit key") }
+                        placeholder = { Text("The 17-digit recharge key") }
                     )
 
                     Text(
